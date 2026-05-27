@@ -12,6 +12,7 @@ import util.index as index
 import models.networks as networks
 import models.losses as losses
 from models import arch
+from models.arch.rdnet import LaplacianPyramid, RDNet
 
 from .base_model import BaseModel
 from PIL import Image
@@ -111,6 +112,11 @@ class ERRNetBase(BaseModel):
 
         self.issyn = not _flag_enabled(data, 'real', default=False)
         self.aligned = not _flag_enabled(data, 'unaligned', default=False)
+
+        if getattr(self, 'use_rdnet', False):
+            self.mask_gt = None
+            if self.issyn and target_r is not None:
+                self.mask_gt = target_r.mean(dim=1, keepdim=True).clamp(0, 1)
         
         if target_t is not None:            
             self.target_edge = self.edge_map(self.target_t)         
@@ -197,22 +203,57 @@ class ERRNetModel(ERRNetBase):
         print('--------------------- Model ---------------------')
         print('##################### NetG #####################')
         networks.print_network(self.net_i)
+        if self.use_rdnet:
+            print('##################### RDNet #####################')
+            networks.print_network(self.rdnet)
         if self.isTrain and self.opt.lambda_gan > 0:
             print('##################### NetD #####################')
             networks.print_network(self.netD)
 
     def _eval(self):
         self.net_i.eval()
+        if self.use_rdnet:
+            self.rdnet.eval()
 
     def _train(self):
         self.net_i.train()
+        if self.use_rdnet:
+            if self.rdnet_trainable:
+                self.rdnet.train()
+            else:
+                self.rdnet.eval()
 
     def initialize(self, opt):
         BaseModel.initialize(self, opt)
         self.device = torch.device("cuda:%d" % self.gpu_ids[0] if len(self.gpu_ids) > 0 else "cpu")
 
+        self.use_rdnet = getattr(opt, 'use_rdnet', False)
+        self.rdnet = None
+        self.lap_pyramid = None
+        self.rdnet_trainable = False
+        self.mask_loss = None
+        self.mask_pred = None
+        self.mask_gt = None
+
         in_channels = 3
         self.vgg = None
+
+        if self.use_rdnet:
+            self.lap_pyramid = LaplacianPyramid(channels=3).to(self.device)
+            rd_in_channels = 3 + self.lap_pyramid.out_channels
+            self.rdnet = RDNet(rd_in_channels, out_channels=1).to(self.device)
+            networks.init_weights(self.rdnet, init_type=opt.init_type)
+            if opt.rdnet_path:
+                rd_state = _torch_load_compat(opt.rdnet_path, map_location=self.device)
+                if isinstance(rd_state, dict) and 'rdnet' in rd_state:
+                    self.rdnet.load_state_dict(rd_state['rdnet'])
+                else:
+                    self.rdnet.load_state_dict(rd_state)
+            self.rdnet_trainable = self.isTrain and not opt.rdnet_freeze
+            if not self.rdnet_trainable:
+                for param in self.rdnet.parameters():
+                    param.requires_grad = False
+            in_channels += 1
         
         if opt.hyper:
             self.vgg = losses.Vgg19(requires_grad=False).to(self.device)
@@ -223,6 +264,8 @@ class ERRNetModel(ERRNetBase):
         self.edge_map = EdgeMap(scale=1).to(self.device)
 
         if self.isTrain:
+            if self.use_rdnet:
+                self.mask_loss = nn.L1Loss()
             # define loss functions
             self.loss_dic = losses.init_loss(opt, self.Tensor)
             vggloss = losses.ContentLoss()
@@ -251,7 +294,10 @@ class ERRNetModel(ERRNetBase):
             self._init_optimizer([self.optimizer_D])
 
             # initialize optimizers
-            self.optimizer_G = torch.optim.Adam(self.net_i.parameters(), 
+            g_params = list(self.net_i.parameters())
+            if self.use_rdnet and self.rdnet_trainable:
+                g_params += list(self.rdnet.parameters())
+            self.optimizer_G = torch.optim.Adam(g_params,
                 lr=opt.lr, betas=(0.9, 0.999), weight_decay=opt.wd)
 
             self._init_optimizer([self.optimizer_G])
@@ -281,6 +327,7 @@ class ERRNetModel(ERRNetBase):
         self.loss_icnn_pixel = None
         self.loss_icnn_vgg = None
         self.loss_G_GAN = None
+        self.loss_mask = None
 
         if self.opt.lambda_gan > 0:
             self.loss_G_GAN = self.loss_dic['gan'].get_g_loss(
@@ -299,12 +346,24 @@ class ERRNetModel(ERRNetBase):
             self.loss_CX = self.loss_dic['t_cx'].get_loss(self.output_i, self.target_t)
             
             self.loss_G += self.loss_CX
+
+        if self.use_rdnet and self.mask_gt is not None and self.opt.lambda_mask > 0:
+            self.loss_mask = self.mask_loss(self.mask_pred, self.mask_gt)
+            self.loss_G += self.loss_mask * self.opt.lambda_mask
         
         self.loss_G.backward()
 
     def forward(self):
         # without edge
         input_i = self.input
+
+        if self.use_rdnet:
+            lap = self.lap_pyramid(self.input)
+            rd_input = torch.cat([self.input, lap], dim=1)
+            self.mask_pred = self.rdnet(rd_input)
+            input_i = torch.cat([input_i, self.mask_pred], dim=1)
+        else:
+            self.mask_pred = None
 
         if self.vgg is not None:
             hypercolumn = self.vgg(self.input)
@@ -347,6 +406,9 @@ class ERRNetModel(ERRNetBase):
         if self.loss_CX is not None:
             ret_errors['CX'] = self.loss_CX.item()
 
+        if self.loss_mask is not None:
+            ret_errors['MaskL1'] = self.loss_mask.item()
+
         return ret_errors
 
     def get_current_visuals(self):
@@ -355,6 +417,11 @@ class ERRNetModel(ERRNetBase):
         ret_visuals['output_i'] = tensor2im(self.output_i).astype(np.uint8)        
         ret_visuals['target'] = tensor2im(self.target_t).astype(np.uint8)
         ret_visuals['residual'] = tensor2im((self.input - self.output_i)).astype(np.uint8)
+
+        if self.mask_pred is not None:
+            ret_visuals['mask_pred'] = tensor2im(self.mask_pred).astype(np.uint8)
+        if self.mask_gt is not None:
+            ret_visuals['mask_gt'] = tensor2im(self.mask_gt).astype(np.uint8)
 
         return ret_visuals       
 
@@ -369,11 +436,15 @@ class ERRNetModel(ERRNetBase):
             model.epoch = state_dict['epoch']
             model.iterations = state_dict['iterations']
             model.net_i.load_state_dict(state_dict['icnn'])
+            if model.use_rdnet and 'rdnet' in state_dict:
+                model.rdnet.load_state_dict(state_dict['rdnet'])
             if model.isTrain:
                 model.optimizer_G.load_state_dict(state_dict['opt_g'])
         else:
             state_dict = _torch_load_compat(icnn_path, map_location=torch.device('cpu'))
             model.net_i.load_state_dict(state_dict['icnn'])
+            if model.use_rdnet and 'rdnet' in state_dict:
+                model.rdnet.load_state_dict(state_dict['rdnet'])
             model.epoch = state_dict['epoch']
             model.iterations = state_dict['iterations']
             # if model.isTrain:
@@ -400,6 +471,9 @@ class ERRNetModel(ERRNetBase):
                 'opt_d': self.optimizer_D.state_dict(),
                 'netD': self.netD.state_dict(),
             })
+
+        if self.use_rdnet:
+            state_dict.update({'rdnet': self.rdnet.state_dict()})
 
         return state_dict
 
