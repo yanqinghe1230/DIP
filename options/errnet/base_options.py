@@ -14,6 +14,9 @@ class BaseOptions(Base):
         self.parser.add_argument('--init_type', type=str, default='edsr', help='network initialization [normal|xavier|kaiming|orthogonal|uniform]')
         # for network
         self.parser.add_argument('--hyper', action='store_true', help='if true, augment input with vgg hypercolumn feature')
+        self.parser.add_argument('--use_rdnet', action='store_true', help='if true, use RDNet mask guidance')
+        self.parser.add_argument('--rdnet_path', type=str, default=None, help='path to pretrained RDNet weights')
+        self.parser.add_argument('--rdnet_freeze', action='store_true', help='if true, freeze RDNet during ERRNet training')
         
         self.initialized = True
 

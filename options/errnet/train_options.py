@@ -39,5 +39,6 @@ class TrainOptions(BaseOptions):
         
         self.parser.add_argument('--lambda_gan', type=float, default=0.01, help='weight for gan loss')
         self.parser.add_argument('--lambda_vgg', type=float, default=0.1, help='weight for vgg loss')
+        self.parser.add_argument('--lambda_mask', type=float, default=1.0, help='weight for RDNet mask loss')
         
         self.isTrain = True
