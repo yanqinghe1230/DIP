@@ -358,6 +358,11 @@ class ERRNetModel(ERRNetBase):
         input_i = self.input
 
         if self.use_rdnet:
+            input_device = self.input.device
+            if next(self.rdnet.parameters()).device != input_device:
+                self.rdnet = self.rdnet.to(input_device)
+            if self.lap_pyramid.kernel.device != input_device:
+                self.lap_pyramid = self.lap_pyramid.to(input_device)
             lap = self.lap_pyramid(self.input)
             rd_input = torch.cat([self.input, lap], dim=1)
             self.mask_pred = self.rdnet(rd_input)

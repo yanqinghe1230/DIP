@@ -97,6 +97,11 @@ class RDNetModel(BaseModel):
             self.mask_gt = target_r.mean(dim=1, keepdim=True).clamp(0, 1)
 
     def forward(self):
+        input_device = self.input.device
+        if next(self.net_rd.parameters()).device != input_device:
+            self.net_rd = self.net_rd.to(input_device)
+        if self.lap_pyramid.kernel.device != input_device:
+            self.lap_pyramid = self.lap_pyramid.to(input_device)
         lap = self.lap_pyramid(self.input)
         rd_input = torch.cat([self.input, lap], dim=1)
         self.mask_pred = self.net_rd(rd_input)
