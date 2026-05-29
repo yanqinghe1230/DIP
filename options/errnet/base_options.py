@@ -15,6 +15,8 @@ class BaseOptions(Base):
         # for network
         self.parser.add_argument('--hyper', action='store_true', help='if true, augment input with vgg hypercolumn feature')
         self.parser.add_argument('--use_rdnet', action='store_true', help='if true, use RDNet mask guidance')
+        self.parser.add_argument('--rdnet_guidance', type=str, default='concat', choices=['concat', 'gate'],
+                     help='RDNet guidance mode: concat uses mask as extra input channel; gate uses mask to gate high-level features')
         self.parser.add_argument('--rdnet_path', type=str, default=None, help='path to pretrained RDNet weights')
         self.parser.add_argument('--rdnet_freeze', action='store_true', help='if true, freeze RDNet during ERRNet training')
         
