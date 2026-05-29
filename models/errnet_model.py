@@ -228,6 +228,7 @@ class ERRNetModel(ERRNetBase):
         self.device = torch.device("cuda:%d" % self.gpu_ids[0] if len(self.gpu_ids) > 0 else "cpu")
 
         self.use_rdnet = getattr(opt, 'use_rdnet', False)
+        self.rdnet_guidance = getattr(opt, 'rdnet_guidance', 'concat')
         self.rdnet = None
         self.lap_pyramid = None
         self.rdnet_trainable = False
@@ -239,6 +240,8 @@ class ERRNetModel(ERRNetBase):
         self.vgg = None
 
         if self.use_rdnet:
+            if self.rdnet_guidance not in ('concat', 'gate'):
+                raise ValueError('Unsupported rdnet_guidance: %s' % self.rdnet_guidance)
             self.lap_pyramid = LaplacianPyramid(channels=3).to(self.device)
             rd_in_channels = 3 + self.lap_pyramid.out_channels
             self.rdnet = RDNet(rd_in_channels, out_channels=1).to(self.device)
@@ -253,7 +256,8 @@ class ERRNetModel(ERRNetBase):
             if not self.rdnet_trainable:
                 for param in self.rdnet.parameters():
                     param.requires_grad = False
-            in_channels += 1
+            if self.rdnet_guidance == 'concat':
+                in_channels += 1
         
         if opt.hyper:
             self.vgg = losses.Vgg19(requires_grad=False).to(self.device)
@@ -356,6 +360,7 @@ class ERRNetModel(ERRNetBase):
     def forward(self):
         # without edge
         input_i = self.input
+        gate_i = None
 
         if self.use_rdnet:
             input_device = self.input.device
@@ -366,7 +371,10 @@ class ERRNetModel(ERRNetBase):
             lap = self.lap_pyramid(self.input)
             rd_input = torch.cat([self.input, lap], dim=1)
             self.mask_pred = self.rdnet(rd_input)
-            input_i = torch.cat([input_i, self.mask_pred], dim=1)
+            if self.rdnet_guidance == 'concat':
+                input_i = torch.cat([input_i, self.mask_pred], dim=1)
+            else:
+                gate_i = self.mask_pred
         else:
             self.mask_pred = None
 
@@ -378,7 +386,12 @@ class ERRNetModel(ERRNetBase):
             input_i.extend(hypercolumn)
             input_i = torch.cat(input_i, dim=1)
 
-        output_i = self.net_i(input_i)
+        if gate_i is not None:
+            if not getattr(self.net_i, 'supports_gate', False):
+                raise NotImplementedError('net_i does not support gated guidance')
+            output_i = self.net_i(input_i, gate=gate_i)
+        else:
+            output_i = self.net_i(input_i)
 
         self.output_i = output_i
 

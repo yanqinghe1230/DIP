@@ -54,6 +54,9 @@ class DRNet(torch.nn.Module):
         act = nn.ReLU(True)
         
         self.pyramid_module = None
+        self.supports_gate = True
+        self.gate_conv = nn.Conv2d(1, n_feats, kernel_size=1, stride=1)
+        self.gate_alpha = nn.Parameter(torch.tensor(0.1))
         self.conv1 = ConvLayer(conv, in_channels, n_feats, kernel_size=bottom_kernel_size, stride=1, norm=None, act=act)
         self.conv2 = ConvLayer(conv, n_feats, n_feats, kernel_size=3, stride=1, norm=norm, act=act)
         self.conv3 = ConvLayer(conv, n_feats, n_feats, kernel_size=3, stride=2, norm=norm, act=act)
@@ -76,11 +79,21 @@ class DRNet(torch.nn.Module):
             self.pyramid_module = PyramidPooling(n_feats, n_feats, scales=(4,8,16,32), ct_channels=n_feats//4)
             self.deconv3 = ConvLayer(conv, n_feats, out_channels, kernel_size=1, stride=1, norm=None, act=act)
         
-    def forward(self, x):
+    def _apply_gate(self, feats, gate):
+        if gate is None:
+            return feats
+        if gate.shape[1] != 1:
+            gate = gate.mean(dim=1, keepdim=True)
+        gate = F.interpolate(gate, size=feats.shape[2:], mode='bilinear', align_corners=False)
+        gate = torch.sigmoid(self.gate_conv(gate))
+        return feats * (1 + self.gate_alpha * gate)
+
+    def forward(self, x, gate=None):
         x = self.conv1(x)
         x = self.conv2(x)
         x = self.conv3(x)
         x = self.res_module(x)
+        x = self._apply_gate(x, gate)
 
         x = self.deconv1(x)
         x = self.deconv2(x)
