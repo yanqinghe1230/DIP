@@ -56,7 +56,8 @@ class DRNet(torch.nn.Module):
         self.pyramid_module = None
         self.supports_gate = True
         self.gate_conv = nn.Conv2d(1, n_feats, kernel_size=1, stride=1)
-        self.gate_alpha = nn.Parameter(torch.tensor(0.1))
+        # Parameterize alpha to keep it non-negative via softplus.
+        self.gate_alpha = nn.Parameter(torch.tensor(-2.25))
         self.conv1 = ConvLayer(conv, in_channels, n_feats, kernel_size=bottom_kernel_size, stride=1, norm=None, act=act)
         self.conv2 = ConvLayer(conv, n_feats, n_feats, kernel_size=3, stride=1, norm=norm, act=act)
         self.conv3 = ConvLayer(conv, n_feats, n_feats, kernel_size=3, stride=2, norm=norm, act=act)
@@ -86,7 +87,8 @@ class DRNet(torch.nn.Module):
             gate = gate.mean(dim=1, keepdim=True)
         gate = F.interpolate(gate, size=feats.shape[2:], mode='bilinear', align_corners=False)
         gate = torch.sigmoid(self.gate_conv(gate))
-        return feats * (1 + self.gate_alpha * gate)
+        alpha = F.softplus(self.gate_alpha)
+        return feats * (1 + alpha * gate)
 
     def forward(self, x, gate=None):
         x = self.conv1(x)
