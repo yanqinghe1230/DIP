@@ -50,12 +50,6 @@ def parse_args():
         ),
     )
     parser.add_argument(
-        "--threshold",
-        type=float,
-        default=0.5,
-        help="Threshold for M_hat (binary mask).",
-    )
-    parser.add_argument(
         "--max_long_edge",
         type=int,
         default=None,
@@ -242,20 +236,12 @@ def main():
                 rd_input = torch.cat([input_tensor, lap_feat], dim=1)
                 mask_pred = rdnet(rd_input).cpu()
 
-            panels = []
-            labels = []
-            if mask_gt is not None:
-                mask_gt_4d = mask_gt.unsqueeze(0)
-                mask_pred_times_gt = mask_pred * mask_gt_4d
-                mask_hat = (mask_pred > args.threshold).float()
-                mask_hat_times_gt = mask_hat * mask_gt_4d
+            panels = [m_img]
+            labels = ["Blended"]
 
-                panels.append(tensor_to_gray_image(mask_gt_4d))
+            if mask_gt is not None:
+                panels.append(tensor_to_gray_image(mask_gt.unsqueeze(0)))
                 labels.append("M_gt")
-                panels.append(tensor_to_gray_image(mask_pred_times_gt))
-                labels.append("M_pred*M_gt")
-                panels.append(tensor_to_gray_image(mask_hat_times_gt))
-                labels.append("M_hat*M_gt")
 
             panels.append(tensor_to_gray_image(mask_pred))
             labels.append("M_pred")
