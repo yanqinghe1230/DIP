@@ -4,6 +4,54 @@ from torch import nn
 import torch.nn.functional as F
 
 
+class StructureAwareGate(nn.Module):
+    """Conditioning signal generator for reflection-aware feature modulation.
+
+    Projects the Laplacian structural prior into feature space, then combines
+    it with the reflection confidence map M to produce a per-channel spatial
+    attention map A. The bottleneck feature F is deliberately excluded from
+    the gate input — this is a pure conditioning signal, not self-attention.
+
+        L_f = Conv(Lap)              # low-level structure → feature space
+        A   = σ(Conv([L_f, M]))      # joint spatial attention per channel
+        F'  = F * (1 + α_c · A_c)    # channel-wise modulation
+
+    where α_c ∈ R^C is learned per channel (initialised near identity).
+    """
+
+    def __init__(self, lap_channels, n_feats, reduction=4):
+        super().__init__()
+        # Project Laplacian (low-level spatial structure) into feature space
+        self.lap_proj = nn.Sequential(
+            nn.Conv2d(lap_channels, n_feats, 1),
+            nn.ReLU(inplace=True),
+        )
+        # Gate: [L_f, M] → A   — F is NOT an input (pure conditioning)
+        self.gate = nn.Sequential(
+            nn.Conv2d(n_feats + 1, n_feats // reduction, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(n_feats // reduction, n_feats, 1),
+            nn.Sigmoid(),
+        )
+        # Per-channel modulation strength (softplus → always non-negative)
+        self.alpha = nn.Parameter(torch.ones(n_feats))
+
+    def forward(self, feats, lap_features, mask):
+        target_size = feats.shape[2:]
+        if lap_features.shape[2:] != target_size:
+            lap_features = F.interpolate(lap_features, size=target_size,
+                                         mode='bilinear', align_corners=False)
+        if mask.shape[2:] != target_size:
+            mask = F.interpolate(mask, size=target_size,
+                                 mode='bilinear', align_corners=False)
+        # Project Laplacian into feature space
+        L_f = self.lap_proj(lap_features)
+        # Joint conditioning: structure prior + reflection confidence
+        A = self.gate(torch.cat([L_f, mask], dim=1))          # (B, C, H, W)
+        alpha = F.softplus(self.alpha).view(1, -1, 1, 1)      # (1, C, 1, 1)
+        return feats * (1.0 + alpha * A)
+
+
 class PyramidPooling(nn.Module):
     def __init__(self, in_channels, out_channels, scales=(4, 8, 16, 32), ct_channels=1):
         super().__init__()
@@ -45,19 +93,28 @@ class SELayer(nn.Module):
      
 
 class DRNet(torch.nn.Module):
-    def __init__(self, in_channels, out_channels, n_feats, n_resblocks, norm=nn.BatchNorm2d, 
-    se_reduction=None, res_scale=1, bottom_kernel_size=3, pyramid=False):
+    def __init__(self, in_channels, out_channels, n_feats, n_resblocks, norm=nn.BatchNorm2d,
+    se_reduction=None, res_scale=1, bottom_kernel_size=3, pyramid=False,
+    gate_type='simple', lap_channels=12):
         super(DRNet, self).__init__()
         # Initial convolution layers
         conv = nn.Conv2d
         deconv = nn.ConvTranspose2d
         act = nn.ReLU(True)
-        
+
         self.pyramid_module = None
         self.supports_gate = True
-        self.gate_conv = nn.Conv2d(1, n_feats, kernel_size=1, stride=1)
-        # Parameterize alpha to keep it non-negative via softplus.
-        self.gate_alpha = nn.Parameter(torch.tensor(-2.25))
+        self.gate_type = gate_type
+
+        if gate_type == 'structure_aware':
+            self.structure_gate = StructureAwareGate(lap_channels, n_feats)
+            self.gate_conv = None
+            self.gate_alpha = None
+        else:
+            self.structure_gate = None
+            self.gate_conv = nn.Conv2d(1, n_feats, kernel_size=1, stride=1)
+            # Parameterize alpha to keep it non-negative via softplus.
+            self.gate_alpha = nn.Parameter(torch.tensor(-2.25))
         self.conv1 = ConvLayer(conv, in_channels, n_feats, kernel_size=bottom_kernel_size, stride=1, norm=None, act=act)
         self.conv2 = ConvLayer(conv, n_feats, n_feats, kernel_size=3, stride=1, norm=norm, act=act)
         self.conv3 = ConvLayer(conv, n_feats, n_feats, kernel_size=3, stride=2, norm=norm, act=act)
@@ -90,12 +147,16 @@ class DRNet(torch.nn.Module):
         alpha = F.softplus(self.gate_alpha)
         return feats * (1 + alpha * gate)
 
-    def forward(self, x, gate=None):
+    def forward(self, x, gate=None, lap_features=None):
         x = self.conv1(x)
         x = self.conv2(x)
         x = self.conv3(x)
         x = self.res_module(x)
-        x = self._apply_gate(x, gate)
+
+        if self.gate_type == 'structure_aware' and lap_features is not None and gate is not None:
+            x = self.structure_gate(x, lap_features, gate)
+        else:
+            x = self._apply_gate(x, gate)
 
         x = self.deconv1(x)
         x = self.deconv2(x)

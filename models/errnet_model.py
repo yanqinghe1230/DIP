@@ -263,7 +263,17 @@ class ERRNetModel(ERRNetBase):
             self.vgg = losses.Vgg19(requires_grad=False).to(self.device)
             in_channels += 1472
         
-        self.net_i = arch.__dict__[self.opt.inet](in_channels, 3).to(self.device)
+        self.gate_type = getattr(opt, 'gate_type', 'simple')
+        net_kwargs = {}
+        if self.gate_type == 'structure_aware':
+            if not self.use_rdnet:
+                raise ValueError('gate_type=structure_aware requires use_rdnet=True')
+            if self.rdnet_guidance != 'gate':
+                raise ValueError('gate_type=structure_aware requires rdnet_guidance=gate')
+            net_kwargs['gate_type'] = 'structure_aware'
+            net_kwargs['lap_channels'] = self.lap_pyramid.out_channels
+
+        self.net_i = arch.__dict__[self.opt.inet](in_channels, 3, **net_kwargs).to(self.device)
         networks.init_weights(self.net_i, init_type=opt.init_type) # using default initialization as EDSR
         self.edge_map = EdgeMap(scale=1).to(self.device)
 
@@ -361,6 +371,7 @@ class ERRNetModel(ERRNetBase):
         # without edge
         input_i = self.input
         gate_i = None
+        lap_features = None
 
         if self.use_rdnet:
             input_device = self.input.device
@@ -368,8 +379,8 @@ class ERRNetModel(ERRNetBase):
                 self.rdnet = self.rdnet.to(input_device)
             if self.lap_pyramid.kernel.device != input_device:
                 self.lap_pyramid = self.lap_pyramid.to(input_device)
-            lap = self.lap_pyramid(self.input)
-            rd_input = torch.cat([self.input, lap], dim=1)
+            lap_features = self.lap_pyramid(self.input)
+            rd_input = torch.cat([self.input, lap_features], dim=1)
             self.mask_pred = self.rdnet(rd_input)
             if self.rdnet_guidance == 'concat':
                 input_i = torch.cat([input_i, self.mask_pred], dim=1)
@@ -389,7 +400,10 @@ class ERRNetModel(ERRNetBase):
         if gate_i is not None:
             if not getattr(self.net_i, 'supports_gate', False):
                 raise NotImplementedError('net_i does not support gated guidance')
-            output_i = self.net_i(input_i, gate=gate_i)
+            if self.gate_type == 'structure_aware':
+                output_i = self.net_i(input_i, gate=gate_i, lap_features=lap_features)
+            else:
+                output_i = self.net_i(input_i, gate=gate_i)
         else:
             output_i = self.net_i(input_i)
 
