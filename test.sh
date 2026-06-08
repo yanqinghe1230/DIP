@@ -15,11 +15,14 @@ fi
 # RDNet guidance mode: gate (soft) or concat (legacy).
 RDNET_GUIDANCE="gate"
 
+# Gate type: simple (M only) or structure_aware (Laplacian + M conditioning).
+GATE_TYPE="structure_aware"
+
 DATASETS=(ceilnet_table2 real20 objects postcard wild)
 
 for ds in "${DATASETS[@]}"; do
 	python test_errnet.py --name "errnet_rdnet_${ds}" --dataset "${ds}" -r \
 		--icnn_path "${CKPT_ERRNET}" --use_rdnet --rdnet_guidance "${RDNET_GUIDANCE}" \
-		--rdnet_path "${CKPT_RDNET}" ${HYPER_FLAG}
+		--rdnet_path "${CKPT_RDNET}" --gate_type "${GATE_TYPE}" ${HYPER_FLAG}
 done
 
