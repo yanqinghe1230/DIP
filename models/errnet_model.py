@@ -242,16 +242,42 @@ class ERRNetModel(ERRNetBase):
         if self.use_rdnet:
             if self.rdnet_guidance not in ('concat', 'gate'):
                 raise ValueError('Unsupported rdnet_guidance: %s' % self.rdnet_guidance)
-            self.lap_pyramid = LaplacianPyramid(channels=3).to(self.device)
-            rd_in_channels = 3 + self.lap_pyramid.out_channels
+
+            self.rdnet_no_laplacian = getattr(opt, 'rdnet_no_laplacian', False)
+            self.gate_type = getattr(opt, 'gate_type', 'simple')
+
+            # LaplacianPyramid is needed when:
+            # (a) RDNet uses Laplacian features as input (!rdnet_no_laplacian), OR
+            # (b) structure_aware gate requires Laplacian as conditioning signal
+            need_lap = (not self.rdnet_no_laplacian) or \
+                       (self.rdnet_guidance == 'gate' and self.gate_type == 'structure_aware')
+
+            if need_lap:
+                self.lap_pyramid = LaplacianPyramid(channels=3).to(self.device)
+            else:
+                self.lap_pyramid = None
+
+            if not self.rdnet_no_laplacian:
+                rd_in_channels = 3 + self.lap_pyramid.out_channels
+            else:
+                rd_in_channels = 3  # RGB only ablation
+
             self.rdnet = RDNet(rd_in_channels, out_channels=1).to(self.device)
             networks.init_weights(self.rdnet, init_type=opt.init_type)
             if opt.rdnet_path:
                 rd_state = _torch_load_compat(opt.rdnet_path, map_location=self.device)
                 if isinstance(rd_state, dict) and 'rdnet' in rd_state:
-                    self.rdnet.load_state_dict(rd_state['rdnet'])
-                else:
+                    rd_state = rd_state['rdnet']
+                try:
                     self.rdnet.load_state_dict(rd_state)
+                except RuntimeError:
+                    print('[i] RDNet weight shape mismatch (likely different input channels '
+                          'due to --rdnet_no_laplacian). Loading with strict=False.')
+                    missing, unexpected = self.rdnet.load_state_dict(rd_state, strict=False)
+                    if missing:
+                        print(f'    New params (random init): {missing}')
+                    if unexpected:
+                        print(f'    Old params (discarded):   {unexpected}')
             self.rdnet_trainable = self.isTrain and not opt.rdnet_freeze
             if not self.rdnet_trainable:
                 for param in self.rdnet.parameters():
@@ -377,10 +403,19 @@ class ERRNetModel(ERRNetBase):
             input_device = self.input.device
             if next(self.rdnet.parameters()).device != input_device:
                 self.rdnet = self.rdnet.to(input_device)
-            if self.lap_pyramid.kernel.device != input_device:
-                self.lap_pyramid = self.lap_pyramid.to(input_device)
-            lap_features = self.lap_pyramid(self.input)
-            rd_input = torch.cat([self.input, lap_features], dim=1)
+
+            # Compute Laplacian features if available (for RDNet and/or gate)
+            if self.lap_pyramid is not None:
+                if self.lap_pyramid.kernel.device != input_device:
+                    self.lap_pyramid = self.lap_pyramid.to(input_device)
+                lap_features = self.lap_pyramid(self.input)
+
+            # Build RDNet input: with or without Laplacian
+            if self.rdnet_no_laplacian:
+                rd_input = self.input  # ablation: RGB only
+            else:
+                rd_input = torch.cat([self.input, lap_features], dim=1)
+
             self.mask_pred = self.rdnet(rd_input)
             if self.rdnet_guidance == 'concat':
                 input_i = torch.cat([input_i, self.mask_pred], dim=1)
@@ -455,26 +490,173 @@ class ERRNetModel(ERRNetBase):
         if self.mask_gt is not None:
             ret_visuals['mask_gt'] = tensor2im(self.mask_gt).astype(np.uint8)
 
-        return ret_visuals       
+        return ret_visuals
+
+    # ------------------------------------------------------------------
+    # Alpha / Gate analysis helpers (P1: gate modulation analysis)
+    # ------------------------------------------------------------------
+
+    def get_gate_alpha_stats(self):
+        """Return per-channel or scalar alpha statistics from the gate module.
+
+        Returns
+        -------
+        dict with keys:
+            type : 'simple' | 'structure_aware' | None
+            For 'simple':   alpha (float)
+            For 'structure_aware': alpha_mean, alpha_std, alpha_min, alpha_max,
+                                   alpha (np.ndarray, shape [n_feats])
+            None if no gate is active.
+        """
+        net = self.net_i
+        gate_type = getattr(self, 'gate_type', 'simple')
+
+        if gate_type == 'simple':
+            if hasattr(net, 'gate_alpha') and net.gate_alpha is not None:
+                alpha_val = F.softplus(net.gate_alpha).item()
+                return {'type': 'simple', 'alpha': alpha_val}
+        elif gate_type == 'structure_aware':
+            if hasattr(net, 'structure_gate') and net.structure_gate is not None:
+                alpha = F.softplus(net.structure_gate.alpha).detach().cpu()
+                return {
+                    'type': 'structure_aware',
+                    'alpha_mean': alpha.mean().item(),
+                    'alpha_std': alpha.std().item(),
+                    'alpha_min': alpha.min().item(),
+                    'alpha_max': alpha.max().item(),
+                    'alpha_median': alpha.median().item(),
+                    'alpha': alpha.numpy(),
+                }
+        return {'type': None}
+
+    def register_gate_hooks(self):
+        """Register forward hooks to capture gate activation maps.
+
+        Returns
+        -------
+        dict[str, torch.Tensor]  — mutable dict that will be populated each forward pass.
+            'gate_activation' : (1, H, W) spatial map of gate modulation
+            'gate_alpha'      : scalar or per-channel softplus(alpha)
+        """
+        captured = {}
+
+        def _hook_simple(module, input, output):
+            # output = feats * (1 + alpha * gate)
+            # Capture the spatial gate (1, H, W) averaged over channels
+            gate = module._last_gate  # stored in _apply_gate
+            captured['gate_activation'] = gate.detach().cpu()
+            alpha = F.softplus(module.gate_alpha).detach().cpu()
+            captured['gate_alpha'] = alpha
+
+        def _hook_structure_aware(module, input, output):
+            # input = (feats, lap_features, mask)
+            # We want the A map (before alpha modulation) and alphas
+            feats, lap_features, mask = input
+            L_f = module.lap_proj(lap_features)
+            A = module.gate(torch.cat([L_f, mask], dim=1))  # (B, C, H, W)
+            alpha = F.softplus(module.alpha).detach().cpu()   # (C,)
+            # Mean over channels for visualisation
+            captured['gate_activation'] = A.mean(dim=1, keepdim=True).detach().cpu()
+            captured['gate_activation_full'] = A.detach().cpu()  # full per-channel
+            captured['gate_alpha'] = alpha
+
+        net = self.net_i
+        gate_type = getattr(self, 'gate_type', 'simple')
+
+        if gate_type == 'structure_aware' and hasattr(net, 'structure_gate') and net.structure_gate is not None:
+            net.structure_gate.register_forward_hook(_hook_structure_aware)
+        elif hasattr(net, 'gate_conv') and net.gate_conv is not None:
+            # Hook onto gate_conv for simple gate
+            # Patch _apply_gate to store _last_gate
+            original_apply = net._apply_gate
+
+            def patched_apply(feats, gate):
+                if gate is None:
+                    net._last_gate = None
+                    return original_apply(feats, gate)
+                if gate.shape[1] != 1:
+                    gate = gate.mean(dim=1, keepdim=True)
+                gate = F.interpolate(gate, size=feats.shape[2:], mode='bilinear', align_corners=False)
+                gate_out = torch.sigmoid(net.gate_conv(gate))
+                net._last_gate = gate_out
+                alpha = F.softplus(net.gate_alpha)
+                return feats * (1 + alpha * gate_out)
+
+            net._apply_gate = patched_apply
+            # Hook onto the patched method — use a post-forward hook on gate_conv
+            net.gate_conv.register_forward_hook(_hook_simple)
+
+        return captured
+
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _load_state_dict_with_gate_migration(module, state_dict, module_name, target_gate_type):
+        """Load state_dict with graceful gate_type migration.
+
+        When migrating checkpoints across gate_type ('simple' ↔ 'structure_aware'),
+        gate-specific keys will mismatch. This helper falls back to strict=False,
+        allowing encoder/decoder weights to transfer while new gate params are
+        randomly initialised.
+        """
+        try:
+            module.load_state_dict(state_dict)
+        except RuntimeError as e:
+            missing = []
+            unexpected = []
+            for line in str(e).split('\n'):
+                line = line.strip()
+                if 'Missing key(s)' in line:
+                    missing = [k.strip().strip('"') for k in line.split(':')[1].split(',') if k.strip()]
+                if 'Unexpected key(s)' in line:
+                    unexpected = [k.strip().strip('"') for k in line.split(':')[1].split(',') if k.strip()]
+            all_gate_keys = missing + unexpected
+            is_gate_mismatch = all(
+                'structure_gate' in k or 'gate_conv' in k or 'gate_alpha' in k
+                for k in all_gate_keys
+            )
+            if is_gate_mismatch and all_gate_keys:
+                print(f'[i] {module_name}: gate_type mismatch detected '
+                      f'(target={target_gate_type}). '
+                      f'Loading compatible weights (strict=False).')
+                if missing:
+                    print(f'    New params (random init): {missing}')
+                if unexpected:
+                    print(f'    Old params (discarded):   {unexpected}')
+                missing_keys, unexpected_keys = module.load_state_dict(state_dict, strict=False)
+                if missing_keys:
+                    # Only gate keys should remain — anything else is a real problem
+                    non_gate_missing = [k for k in missing_keys
+                                        if 'structure_gate' not in k
+                                        and 'gate_conv' not in k
+                                        and 'gate_alpha' not in k]
+                    if non_gate_missing:
+                        raise RuntimeError(
+                            f'Non-gate keys still missing after migration: {non_gate_missing}')
+            else:
+                raise
 
     @staticmethod
     def load(model, resume_epoch=None):
         icnn_path = model.opt.icnn_path
         state_dict = None
+        target_gate_type = getattr(model.opt, 'gate_type', 'simple')
 
         if icnn_path is None:
             model_path = util.get_model_list(model.save_dir, model.name(), epoch=resume_epoch)
             state_dict = _torch_load_compat(model_path)
             model.epoch = state_dict['epoch']
             model.iterations = state_dict['iterations']
-            model.net_i.load_state_dict(state_dict['icnn'])
+            ERRNetModel._load_state_dict_with_gate_migration(
+                model.net_i, state_dict['icnn'], 'net_i', target_gate_type)
             if model.use_rdnet and 'rdnet' in state_dict:
                 model.rdnet.load_state_dict(state_dict['rdnet'])
             if model.isTrain:
                 model.optimizer_G.load_state_dict(state_dict['opt_g'])
         else:
             state_dict = _torch_load_compat(icnn_path, map_location=torch.device('cpu'))
-            model.net_i.load_state_dict(state_dict['icnn'])
+            ERRNetModel._load_state_dict_with_gate_migration(
+                model.net_i, state_dict['icnn'], 'net_i', target_gate_type)
             if model.use_rdnet and 'rdnet' in state_dict:
                 model.rdnet.load_state_dict(state_dict['rdnet'])
             model.epoch = state_dict['epoch']

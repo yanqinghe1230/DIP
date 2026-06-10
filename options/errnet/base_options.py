@@ -19,6 +19,8 @@ class BaseOptions(Base):
                      help='RDNet guidance mode: concat uses mask as extra input channel; gate uses mask to gate high-level features')
         self.parser.add_argument('--rdnet_path', type=str, default=None, help='path to pretrained RDNet weights')
         self.parser.add_argument('--rdnet_freeze', action='store_true', help='if true, freeze RDNet during ERRNet training')
+        self.parser.add_argument('--rdnet_no_laplacian', action='store_true',
+                     help='if true, RDNet receives only RGB input (no Laplacian pyramid); for ablation study')
         self.parser.add_argument('--gate_type', type=str, default='simple', choices=['simple', 'structure_aware'],
                      help='gate mechanism: simple uses M only; structure_aware uses [Lap_proj, M] as conditioning signal')
 
