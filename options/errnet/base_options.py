@@ -21,7 +21,7 @@ class BaseOptions(Base):
         self.parser.add_argument('--rdnet_freeze', action='store_true', help='if true, freeze RDNet during ERRNet training')
         self.parser.add_argument('--rdnet_no_laplacian', action='store_true',
                      help='if true, RDNet receives only RGB input (no Laplacian pyramid); for ablation study')
-        self.parser.add_argument('--gate_type', type=str, default='simple', choices=['simple', 'structure_aware'],
+        self.parser.add_argument('--gate_type', type=str, default='simple', choices=['simple', 'per_channel', 'structure_aware'],
                      help='gate mechanism: simple uses M only; structure_aware uses [Lap_proj, M] as conditioning signal')
 
         self.initialized = True

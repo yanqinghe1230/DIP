@@ -502,10 +502,11 @@ class ERRNetModel(ERRNetBase):
         Returns
         -------
         dict with keys:
-            type : 'simple' | 'structure_aware' | None
+            type : 'simple' | 'per_channel' | 'structure_aware' | None
             For 'simple':   alpha (float)
-            For 'structure_aware': alpha_mean, alpha_std, alpha_min, alpha_max,
-                                   alpha (np.ndarray, shape [n_feats])
+            For 'per_channel' / 'structure_aware':
+                alpha_mean, alpha_std, alpha_min, alpha_max, alpha_median,
+                alpha (np.ndarray, shape [n_feats])
             None if no gate is active.
         """
         net = self.net_i
@@ -515,6 +516,18 @@ class ERRNetModel(ERRNetBase):
             if hasattr(net, 'gate_alpha') and net.gate_alpha is not None:
                 alpha_val = F.softplus(net.gate_alpha).item()
                 return {'type': 'simple', 'alpha': alpha_val}
+        elif gate_type == 'per_channel':
+            if hasattr(net, 'gate_alpha') and net.gate_alpha is not None:
+                alpha = F.softplus(net.gate_alpha).detach().cpu()
+                return {
+                    'type': 'per_channel',
+                    'alpha_mean': alpha.mean().item(),
+                    'alpha_std': alpha.std().item(),
+                    'alpha_min': alpha.min().item(),
+                    'alpha_max': alpha.max().item(),
+                    'alpha_median': alpha.median().item(),
+                    'alpha': alpha.numpy(),
+                }
         elif gate_type == 'structure_aware':
             if hasattr(net, 'structure_gate') and net.structure_gate is not None:
                 alpha = F.softplus(net.structure_gate.alpha).detach().cpu()
@@ -536,38 +549,48 @@ class ERRNetModel(ERRNetBase):
         -------
         dict[str, torch.Tensor]  — mutable dict that will be populated each forward pass.
             'gate_activation' : (1, H, W) spatial map of gate modulation
+                                (channel-mean for per_channel / structure_aware)
             'gate_alpha'      : scalar or per-channel softplus(alpha)
         """
         captured = {}
+        gate_type = getattr(self, 'gate_type', 'simple')
+        net = self.net_i
 
-        def _hook_simple(module, input, output):
-            # output = feats * (1 + alpha * gate)
-            # Capture the spatial gate (1, H, W) averaged over channels
-            gate = module._last_gate  # stored in _apply_gate
-            captured['gate_activation'] = gate.detach().cpu()
-            alpha = F.softplus(module.gate_alpha).detach().cpu()
-            captured['gate_alpha'] = alpha
+        def _hook_gate_conv(module, input, output):
+            """Hook on gate_conv for simple / per_channel gates.
+
+            gate_conv output is sigmoid(M_proj): (B, n_feats, H, W).
+            For 'simple' this is the final gate (alpha is scalar, applied later).
+            For 'per_channel' alpha is per-channel and applied in _apply_gate;
+            we capture the modulated result from _last_gate instead.
+            """
+            if gate_type == 'per_channel':
+                modulated = net._last_gate  # (B, n_feats, H, W), already alpha-modulated
+                if modulated is not None:
+                    captured['gate_activation'] = modulated.mean(
+                        dim=1, keepdim=True).detach().cpu()
+                    captured['gate_activation_full'] = modulated.detach().cpu()
+            else:
+                # simple: gate_out is the spatial attention before scalar alpha
+                gate_out = output  # (B, n_feats, H, W)
+                captured['gate_activation'] = gate_out.mean(
+                    dim=1, keepdim=True).detach().cpu()
+            captured['gate_alpha'] = F.softplus(module.gate_alpha).detach().cpu()
 
         def _hook_structure_aware(module, input, output):
             # input = (feats, lap_features, mask)
-            # We want the A map (before alpha modulation) and alphas
             feats, lap_features, mask = input
             L_f = module.lap_proj(lap_features)
             A = module.gate(torch.cat([L_f, mask], dim=1))  # (B, C, H, W)
             alpha = F.softplus(module.alpha).detach().cpu()   # (C,)
-            # Mean over channels for visualisation
             captured['gate_activation'] = A.mean(dim=1, keepdim=True).detach().cpu()
-            captured['gate_activation_full'] = A.detach().cpu()  # full per-channel
+            captured['gate_activation_full'] = A.detach().cpu()
             captured['gate_alpha'] = alpha
-
-        net = self.net_i
-        gate_type = getattr(self, 'gate_type', 'simple')
 
         if gate_type == 'structure_aware' and hasattr(net, 'structure_gate') and net.structure_gate is not None:
             net.structure_gate.register_forward_hook(_hook_structure_aware)
         elif hasattr(net, 'gate_conv') and net.gate_conv is not None:
-            # Hook onto gate_conv for simple gate
-            # Patch _apply_gate to store _last_gate
+            # Patch _apply_gate to store the final modulated gate activation
             original_apply = net._apply_gate
 
             def patched_apply(feats, gate):
@@ -576,15 +599,19 @@ class ERRNetModel(ERRNetBase):
                     return original_apply(feats, gate)
                 if gate.shape[1] != 1:
                     gate = gate.mean(dim=1, keepdim=True)
-                gate = F.interpolate(gate, size=feats.shape[2:], mode='bilinear', align_corners=False)
+                gate = F.interpolate(gate, size=feats.shape[2:],
+                                     mode='bilinear', align_corners=False)
                 gate_out = torch.sigmoid(net.gate_conv(gate))
-                net._last_gate = gate_out
                 alpha = F.softplus(net.gate_alpha)
-                return feats * (1 + alpha * gate_out)
+                if alpha.dim() >= 1 and alpha.numel() > 1:
+                    # per_channel: store alpha-modulated gate
+                    net._last_gate = alpha.view(1, -1, 1, 1) * gate_out
+                else:
+                    net._last_gate = gate_out
+                return feats * (1 + (alpha.view(1, -1, 1, 1) if alpha.dim() >= 1 and alpha.numel() > 1 else alpha) * gate_out)
 
             net._apply_gate = patched_apply
-            # Hook onto the patched method — use a post-forward hook on gate_conv
-            net.gate_conv.register_forward_hook(_hook_simple)
+            net.gate_conv.register_forward_hook(_hook_gate_conv)
 
         return captured
 
@@ -594,28 +621,58 @@ class ERRNetModel(ERRNetBase):
     def _load_state_dict_with_gate_migration(module, state_dict, module_name, target_gate_type):
         """Load state_dict with graceful gate_type migration.
 
-        When migrating checkpoints across gate_type ('simple' ↔ 'structure_aware'),
-        gate-specific keys will mismatch. This helper falls back to strict=False,
-        allowing encoder/decoder weights to transfer while new gate params are
-        randomly initialised.
+        Handles three mismatch cases when migrating across gate_type
+        ('simple' ↔ 'per_channel' ↔ 'structure_aware'):
+
+        1. Missing / unexpected keys   — different gate sub-module names
+        2. Size mismatch on gate_alpha — scalar ↔ per-channel vector
+        3. Combined                    — both of the above
+
+        In all three cases gate params are re-initialised randomly while
+        encoder/decoder weights transfer via strict=False.
         """
+        GATE_KEY_PATTERNS = ('structure_gate', 'gate_conv', 'gate_alpha')
+
         try:
             module.load_state_dict(state_dict)
         except RuntimeError as e:
+            err_str = str(e)
             missing = []
             unexpected = []
-            for line in str(e).split('\n'):
+            size_mismatch_keys = []
+
+            for line in err_str.split('\n'):
                 line = line.strip()
                 if 'Missing key(s)' in line:
                     missing = [k.strip().strip('"') for k in line.split(':')[1].split(',') if k.strip()]
                 if 'Unexpected key(s)' in line:
                     unexpected = [k.strip().strip('"') for k in line.split(':')[1].split(',') if k.strip()]
-            all_gate_keys = missing + unexpected
-            is_gate_mismatch = all(
-                'structure_gate' in k or 'gate_conv' in k or 'gate_alpha' in k
-                for k in all_gate_keys
+                if 'size mismatch' in line:
+                    # "size mismatch for gate_alpha: copying a param ..."
+                    for pattern in GATE_KEY_PATTERNS:
+                        if pattern in line:
+                            # Extract the key name (word before ':')
+                            parts = line.split()
+                            for i, p in enumerate(parts):
+                                if 'size mismatch for' in ' '.join(parts[max(0,i-3):i+1]):
+                                    key = parts[i+1].rstrip(':')
+                                    size_mismatch_keys.append(key)
+                                    break
+                            else:
+                                # Fallback: scan for known patterns
+                                for p in parts:
+                                    if any(pat in p for pat in GATE_KEY_PATTERNS):
+                                        size_mismatch_keys.append(p.rstrip(':'))
+                                        break
+
+            # Check if ALL mismatches are gate-related
+            all_mismatch_keys = missing + unexpected + size_mismatch_keys
+            is_gate_only = all(
+                any(pattern in k for pattern in GATE_KEY_PATTERNS)
+                for k in all_mismatch_keys
             )
-            if is_gate_mismatch and all_gate_keys:
+
+            if is_gate_only and all_mismatch_keys:
                 print(f'[i] {module_name}: gate_type mismatch detected '
                       f'(target={target_gate_type}). '
                       f'Loading compatible weights (strict=False).')
@@ -623,13 +680,13 @@ class ERRNetModel(ERRNetBase):
                     print(f'    New params (random init): {missing}')
                 if unexpected:
                     print(f'    Old params (discarded):   {unexpected}')
+                if size_mismatch_keys:
+                    print(f'    Size mismatch (re-init):  {size_mismatch_keys}')
                 missing_keys, unexpected_keys = module.load_state_dict(state_dict, strict=False)
                 if missing_keys:
                     # Only gate keys should remain — anything else is a real problem
                     non_gate_missing = [k for k in missing_keys
-                                        if 'structure_gate' not in k
-                                        and 'gate_conv' not in k
-                                        and 'gate_alpha' not in k]
+                                        if not any(pattern in k for pattern in GATE_KEY_PATTERNS)]
                     if non_gate_missing:
                         raise RuntimeError(
                             f'Non-gate keys still missing after migration: {non_gate_missing}')

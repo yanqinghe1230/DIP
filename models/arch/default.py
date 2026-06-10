@@ -110,6 +110,14 @@ class DRNet(torch.nn.Module):
             self.structure_gate = StructureAwareGate(lap_channels, n_feats)
             self.gate_conv = None
             self.gate_alpha = None
+        elif gate_type == 'per_channel':
+            # Per-channel alpha: same gate input (M only) as simple, but
+            # each channel learns its own modulation strength.  Parameter
+            # count matches structure_aware, isolating the Laplacian prior
+            # as the sole difference between per_channel and structure_aware.
+            self.structure_gate = None
+            self.gate_conv = nn.Conv2d(1, n_feats, kernel_size=1, stride=1)
+            self.gate_alpha = nn.Parameter(torch.ones(n_feats))
         else:
             self.structure_gate = None
             self.gate_conv = nn.Conv2d(1, n_feats, kernel_size=1, stride=1)
@@ -145,6 +153,9 @@ class DRNet(torch.nn.Module):
         gate = F.interpolate(gate, size=feats.shape[2:], mode='bilinear', align_corners=False)
         gate = torch.sigmoid(self.gate_conv(gate))
         alpha = F.softplus(self.gate_alpha)
+        if alpha.dim() >= 1 and alpha.numel() > 1:
+            # per-channel alpha: (n_feats,) → (1, n_feats, 1, 1)
+            alpha = alpha.view(1, -1, 1, 1)
         return feats * (1 + alpha * gate)
 
     def forward(self, x, gate=None, lap_features=None):
