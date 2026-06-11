@@ -468,6 +468,15 @@ class ERRNetModel(ERRNetBase):
         if self.loss_mask is not None:
             ret_errors['MaskL1'] = self.loss_mask.item()
 
+        # Log gate alpha values during training to track modulation dynamics
+        if self.use_rdnet and self.rdnet_guidance == 'gate':
+            alpha_stats = self.get_gate_alpha_stats()
+            if alpha_stats['type'] == 'simple':
+                ret_errors['Alpha'] = alpha_stats['alpha']
+            elif alpha_stats['type'] in ('per_channel', 'structure_aware'):
+                ret_errors['Alpha_mean'] = alpha_stats['alpha_mean']
+                ret_errors['Alpha_std'] = alpha_stats['alpha_std']
+
         return ret_errors
 
     def get_current_visuals(self):
