@@ -268,16 +268,8 @@ class ERRNetModel(ERRNetBase):
                 rd_state = _torch_load_compat(opt.rdnet_path, map_location=self.device)
                 if isinstance(rd_state, dict) and 'rdnet' in rd_state:
                     rd_state = rd_state['rdnet']
-                try:
-                    self.rdnet.load_state_dict(rd_state)
-                except RuntimeError:
-                    print('[i] RDNet weight shape mismatch (likely different input channels '
-                          'due to --rdnet_no_laplacian). Loading with strict=False.')
-                    missing, unexpected = self.rdnet.load_state_dict(rd_state, strict=False)
-                    if missing:
-                        print(f'    New params (random init): {missing}')
-                    if unexpected:
-                        print(f'    Old params (discarded):   {unexpected}')
+                ERRNetModel._load_rdnet_compat(self.rdnet, rd_state,
+                                               label='RDNet (--rdnet_path)')
             self.rdnet_trainable = self.isTrain and not opt.rdnet_freeze
             if not self.rdnet_trainable:
                 for param in self.rdnet.parameters():
@@ -694,6 +686,32 @@ class ERRNetModel(ERRNetBase):
                 raise
 
     @staticmethod
+    def _load_rdnet_compat(rdnet_module, rd_state, label='RDNet'):
+        """Load RDNet weights with graceful handling of input-channel mismatch.
+
+        When --rdnet_no_laplacian changes between pretrain and finetune the first
+        conv layer shape differs (3- vs 15-channel input). This helper skips
+        shape-mismatched keys while loading everything else.
+        """
+        try:
+            rdnet_module.load_state_dict(rd_state)
+        except RuntimeError:
+            model_dict = rdnet_module.state_dict()
+            compatible = {}
+            skipped = []
+            for k, v in rd_state.items():
+                if k in model_dict and v.shape == model_dict[k].shape:
+                    compatible[k] = v
+                else:
+                    skipped.append(k)
+            model_dict.update(compatible)
+            rdnet_module.load_state_dict(model_dict, strict=False)
+            if skipped:
+                print(f'[i] {label}: skipped {len(skipped)} key(s) due to shape '
+                      f'mismatch (e.g. different --rdnet_no_laplacian). '
+                      f'These will use random init: {skipped}')
+
+    @staticmethod
     def load(model, resume_epoch=None):
         icnn_path = model.opt.icnn_path
         state_dict = None
@@ -707,7 +725,8 @@ class ERRNetModel(ERRNetBase):
             ERRNetModel._load_state_dict_with_gate_migration(
                 model.net_i, state_dict['icnn'], 'net_i', target_gate_type)
             if model.use_rdnet and 'rdnet' in state_dict:
-                model.rdnet.load_state_dict(state_dict['rdnet'])
+                ERRNetModel._load_rdnet_compat(
+                    model.rdnet, state_dict['rdnet'], label='RDNet (resume)')
             if model.isTrain:
                 model.optimizer_G.load_state_dict(state_dict['opt_g'])
         else:
@@ -715,7 +734,8 @@ class ERRNetModel(ERRNetBase):
             ERRNetModel._load_state_dict_with_gate_migration(
                 model.net_i, state_dict['icnn'], 'net_i', target_gate_type)
             if model.use_rdnet and 'rdnet' in state_dict:
-                model.rdnet.load_state_dict(state_dict['rdnet'])
+                ERRNetModel._load_rdnet_compat(
+                    model.rdnet, state_dict['rdnet'], label='RDNet (--icnn_path)')
             model.epoch = state_dict['epoch']
             model.iterations = state_dict['iterations']
             # if model.isTrain:
