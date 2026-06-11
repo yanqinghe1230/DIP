@@ -281,6 +281,13 @@ def run_analysis(cli_args, opt):
                     if gate_act_np.shape[1] > 1:
                         gate_act_np = gate_act_np.mean(dim=1, keepdim=True)
                     heatmap = gate_activation_heatmap(gate_act_np)
+                    # Resize heatmap to match input resolution (gate is applied
+                    # at bottleneck, which is H/2 × W/2 of the input)
+                    h_in, w_in = input_np.shape[:2]
+                    if heatmap.shape[:2] != (h_in, w_in):
+                        heatmap = np.array(
+                            Image.fromarray(heatmap).resize(
+                                (w_in, h_in), Image.BILINEAR))
                     save_image(heatmap, join(ds_out, f"{i:03d}_gate_activation.png"))
 
                 # Overlay gate activation on input
@@ -291,8 +298,16 @@ def run_analysis(cli_args, opt):
                     gate_map = gate_act_np.squeeze().cpu().float().numpy()
                     gate_map = (gate_map - gate_map.min()) / (
                         gate_map.max() - gate_map.min() + 1e-8)
-                    overlay = (input_np.astype(np.float32) *
-                               0.5 + heatmap.astype(np.float32) * 0.5)
+                    # gate_map is at bottleneck resolution; build a same-size
+                    # heatmap for blending with the input
+                    gate_heatmap = gate_activation_heatmap(gate_act_np)
+                    h_in, w_in = input_np.shape[:2]
+                    if gate_heatmap.shape[:2] != (h_in, w_in):
+                        gate_heatmap = np.array(
+                            Image.fromarray(gate_heatmap).resize(
+                                (w_in, h_in), Image.BILINEAR))
+                    overlay = (input_np.astype(np.float32) * 0.5 +
+                               gate_heatmap.astype(np.float32) * 0.5)
                     save_image(overlay.clip(0, 255).astype(np.uint8),
                                join(ds_out, f"{i:03d}_overlay.png"))
 
