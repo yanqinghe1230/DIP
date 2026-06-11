@@ -100,10 +100,13 @@ def _torch_load_compat(path, map_location=None):
 def tensor2np(image_tensor):
     """Convert (1, C, H, W) tensor to (H, W, C) numpy uint8 array."""
     img = image_tensor.detach().cpu().float().numpy()
+    # Squeeze batch dim → (C, H, W)
+    if img.ndim == 4:
+        img = img[0]
     img = np.clip(img, 0, 1)
     if img.shape[0] == 1:
-        img = np.tile(img, (3, 1, 1))
-    img = np.transpose(img, (1, 2, 0))
+        img = np.tile(img, (3, 1, 1))   # (1, H, W) → (3, H, W)
+    img = np.transpose(img, (1, 2, 0))  # (C, H, W) → (H, W, C)
     return (img * 255).astype(np.uint8)
 
 
