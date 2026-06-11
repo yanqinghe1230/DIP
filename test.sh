@@ -2,7 +2,7 @@
 set -e
 
 # Paths use Linux format. Adjust if your checkpoint names differ.
-CKPT_ERRNET="checkpoints/errnet_mlocal_concat/latest_net_G.pth"
+CKPT_ERRNET="checkpoints/errnet_mlocal_gate_nolap/latest_net_G.pth"
 
 # NOTE: --rdnet_path is NOT needed when the ERRNet checkpoint was trained
 # with --use_rdnet, because state_dict() saves RDNet weights together with
@@ -16,15 +16,21 @@ if [ "$USE_HYPER" -eq 1 ]; then
 fi
 
 # RDNet guidance mode: gate (soft modulation) or concat (mask as 4th input channel).
-RDNET_GUIDANCE="concat"
+RDNET_GUIDANCE="gate"
 
 # Gate type — only used when RDNET_GUIDANCE="gate".
 #   simple           : M → scalar α gate
 #   per_channel      : M → per-channel α gate (same α shape as structure_aware)
 #   structure_aware  : L + M → per-channel α gate (Laplacian prior)
-# When RDNET_GUIDANCE="concat", --gate_type is omitted because the mask is
-# concatenated as an extra input channel and no gate mechanism is triggered.
-GATE_TYPE=""
+GATE_TYPE="simple"
+
+# Set to 1 if RDNet was trained WITHOUT Laplacian input (--rdnet_no_laplacian).
+# This MUST match the training configuration.
+RDNET_NO_LAP=1
+NOLAP_FLAG=""
+if [ "$RDNET_NO_LAP" -eq 1 ]; then
+	NOLAP_FLAG="--rdnet_no_laplacian"
+fi
 
 DATASETS=(ceilnet_table2 real20 objects postcard wild)
 
@@ -35,6 +41,5 @@ for ds in "${DATASETS[@]}"; do
 	fi
 	python test_errnet.py --name "errnet_rdnet_${ds}" --dataset "${ds}" -r \
 		--icnn_path "${CKPT_ERRNET}" --use_rdnet --rdnet_guidance "${RDNET_GUIDANCE}" \
-		${GATE_FLAG} ${HYPER_FLAG}
+		${GATE_FLAG} ${NOLAP_FLAG} ${HYPER_FLAG}
 done
-

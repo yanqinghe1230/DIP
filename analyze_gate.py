@@ -223,8 +223,7 @@ def run_analysis(cli_args, opt):
             num_workers=opt.nThreads, pin_memory=True,
         )
 
-        samples_alpha = []
-        samples_gate_mean = []
+        samples_gate_stats = []
 
         for i, data in enumerate(dataloader):
             if i >= cli_args.num_samples:
@@ -234,29 +233,39 @@ def run_analysis(cli_args, opt):
             with torch.no_grad():
                 model.forward()
 
-            # Collect gate activation statistics
+            # --- Spatial gate activation statistics ---
+            # Global mean is useless (washes out spatial structure).
+            # What matters: how concentrated / localised is the modulation?
             if "gate_activation" in captured:
-                gate_act = captured["gate_activation"]  # (1, 1, H, W)
-                gate_mean = gate_act.mean().item()
-                gate_std = gate_act.std().item()
-                gate_max = gate_act.max().item()
-                samples_gate_mean.append({
-                    "idx": i, "mean": gate_mean, "std": gate_std,
-                    "max": gate_max,
-                })
+                gate_act = captured["gate_activation"]  # (1, 1, H_g, W_g)
+                gate_2d = gate_act.squeeze().float()     # (H_g, W_g)
+                gmin = gate_2d.min()
+                gmax = gate_2d.max()
+                # Normalise to [0, 1] for thresholding
+                gate_n = (gate_2d - gmin) / (gmax - gmin + 1e-8)
 
-            # Alpha per forward pass (should be constant for simple,
-            # identical per pass for structure_aware)
-            if alpha_stats["type"] == "simple":
-                samples_alpha.append(alpha_stats["alpha"])
-            elif alpha_stats["type"] == "structure_aware":
-                samples_alpha.append({
+                spatial_std = gate_2d.std().item()       # higher → more structure
+                peak = gmax.item()
+                # Sparsity: fraction of pixels above a relative threshold
+                sparsity_20 = (gate_n > 0.2).float().mean().item()
+                sparsity_50 = (gate_n > 0.5).float().mean().item()
+                sparsity_80 = (gate_n > 0.8).float().mean().item()
+                # Spatial gradient magnitude — higher → sharper boundaries
+                gy = gate_2d[1:, :] - gate_2d[:-1, :]
+                gx = gate_2d[:, 1:] - gate_2d[:, :-1]
+                grad_mag = (gy.abs().mean() + gx.abs().mean()).item()
+
+                samples_gate_stats.append({
                     "idx": i,
-                    "mean": alpha_stats["alpha_mean"],
-                    "std": alpha_stats["alpha_std"],
+                    "spatial_std": spatial_std,
+                    "peak": peak,
+                    "sparsity_20": sparsity_20,
+                    "sparsity_50": sparsity_50,
+                    "sparsity_80": sparsity_80,
+                    "grad_mag": grad_mag,
                 })
 
-            # Save per-sample visualisation
+            # --- Per-sample visualisation ---
             if not cli_args.no_visuals:
                 ds_out = join(cli_args.output_dir, ds_key)
                 os.makedirs(ds_out, exist_ok=True)
@@ -312,24 +321,27 @@ def run_analysis(cli_args, opt):
                                join(ds_out, f"{i:03d}_overlay.png"))
 
             print(f"  [{i:3d}/{cli_args.num_samples}] "
-                  f"gate_mean={samples_gate_mean[-1]['mean']:.4f}"
-                  if samples_gate_mean else f"  [{i:3d}/{cli_args.num_samples}]")
+                  f"peak={samples_gate_stats[-1]['peak']:.4f} "
+                  f"spatial_std={samples_gate_stats[-1]['spatial_std']:.4f} "
+                  f"sparsity@50={samples_gate_stats[-1]['sparsity_50']:.3f}"
+                  if samples_gate_stats else f"  [{i:3d}/{cli_args.num_samples}]")
 
-        # Dataset summary
-        if samples_gate_mean:
-            gate_means = [s["mean"] for s in samples_gate_mean]
-            gate_maxs = [s["max"] for s in samples_gate_mean]
-            per_dataset_results[ds_key] = {
+        # Dataset summary — aggregate spatial statistics
+        if samples_gate_stats:
+            agg = {
                 "label": spec["label"],
-                "gate_mean_avg": np.mean(gate_means),
-                "gate_mean_std": np.std(gate_means),
-                "gate_max_avg": np.mean(gate_maxs),
-                "n_samples": len(samples_gate_mean),
+                "peak_avg": np.mean([s["peak"] for s in samples_gate_stats]),
+                "spatial_std_avg": np.mean([s["spatial_std"] for s in samples_gate_stats]),
+                "grad_mag_avg": np.mean([s["grad_mag"] for s in samples_gate_stats]),
+                "sparsity50_avg": np.mean([s["sparsity_50"] for s in samples_gate_stats]),
+                "sparsity20_avg": np.mean([s["sparsity_20"] for s in samples_gate_stats]),
+                "n_samples": len(samples_gate_stats),
             }
-            print(f"  Summary: gate_activation "
-                  f"mean={per_dataset_results[ds_key]['gate_mean_avg']:.4f} ± "
-                  f"{per_dataset_results[ds_key]['gate_mean_std']:.4f}, "
-                  f"peak={per_dataset_results[ds_key]['gate_max_avg']:.4f}")
+            per_dataset_results[ds_key] = agg
+            print(f"  Summary: peak={agg['peak_avg']:.4f}  "
+                  f"spatial_std={agg['spatial_std_avg']:.4f}  "
+                  f"grad={agg['grad_mag_avg']:.4f}  "
+                  f"sparsity@50={agg['sparsity50_avg']:.3f}")
 
         dataloader.reset()
 
@@ -352,35 +364,44 @@ def run_analysis(cli_args, opt):
               f"median={alpha_stats['alpha_median']:.4f}")
 
     if per_dataset_results:
-        print(f"\n{'Dataset':<25s} {'Gate mean':>10s} {'Gate std':>10s} "
-              f"{'Gate peak':>10s} {'Samples':>8s}")
-        print("-" * 65)
+        header = (f"{'Dataset':<25s} {'peak':>8s} {'spatial_std':>12s} "
+                  f"{'grad':>8s} {'spars@50':>9s} {'spars@20':>9s} {'N':>5s}")
+        print(f"\n{header}")
+        print("-" * len(header))
         for ds_key in dataset_keys:
             res = per_dataset_results.get(ds_key)
             if res is None:
                 continue
             print(f"{res['label']:<25s} "
-                  f"{res['gate_mean_avg']:10.4f} "
-                  f"{res['gate_mean_std']:10.4f} "
-                  f"{res['gate_max_avg']:10.4f} "
-                  f"{res['n_samples']:8d}")
+                  f"{res['peak_avg']:8.4f} "
+                  f"{res['spatial_std_avg']:12.4f} "
+                  f"{res['grad_mag_avg']:8.4f} "
+                  f"{res['sparsity50_avg']:9.3f} "
+                  f"{res['sparsity20_avg']:9.3f} "
+                  f"{res['n_samples']:5d}")
 
-    # Comparison insight
+    # Comparison insight: sort by spatial structure (std) — higher = more localised
     if len(per_dataset_results) >= 2:
         keys_sorted = sorted(
             per_dataset_results.keys(),
-            key=lambda k: per_dataset_results[k]["gate_mean_avg"],
+            key=lambda k: per_dataset_results[k]["spatial_std_avg"],
         )
-        print(f"\n  Gate activation ranking (low → high):")
+        print(f"\n  Spatial structure ranking (low → high, higher = more localised):")
         for rank, k in enumerate(keys_sorted, 1):
             print(f"    {rank}. {per_dataset_results[k]['label']}: "
-                  f"{per_dataset_results[k]['gate_mean_avg']:.4f}")
+                  f"std={per_dataset_results[k]['spatial_std_avg']:.4f}  "
+                  f"peak={per_dataset_results[k]['peak_avg']:.4f}  "
+                  f"grad={per_dataset_results[k]['grad_mag_avg']:.4f}")
 
         if "wild" in per_dataset_results and "ceilnet_table2" in per_dataset_results:
-            ratio = (per_dataset_results["wild"]["gate_mean_avg"] /
-                     per_dataset_results["ceilnet_table2"]["gate_mean_avg"])
-            print(f"\n  Wild / CEILNet gate activation ratio: {ratio:.2f}x"
-                  f"{' ← stronger modulation on complex reflections' if ratio > 1.05 else ''}")
+            ratio = (per_dataset_results["wild"]["spatial_std_avg"] /
+                     per_dataset_results["ceilnet_table2"]["spatial_std_avg"])
+            print(f"\n  Wild / CEILNet spatial-std ratio: {ratio:.2f}x"
+                  f"{' ← stronger spatial structure in wild reflections' if ratio > 1.05 else ''}")
+            grad_ratio = (per_dataset_results["wild"]["grad_mag_avg"] /
+                          per_dataset_results["ceilnet_table2"]["grad_mag_avg"])
+            print(f"  Wild / CEILNet gradient ratio:    {grad_ratio:.2f}x"
+                  f"{' ← sharper gate boundaries in wild' if grad_ratio > 1.05 else ''}")
 
     # Save summary to file
     os.makedirs(cli_args.output_dir, exist_ok=True)
@@ -398,18 +419,20 @@ def run_analysis(cli_args, opt):
             f.write(f"Alpha min:  {alpha_stats['alpha_min']:.6f}\n")
             f.write(f"Alpha max:  {alpha_stats['alpha_max']:.6f}\n")
             f.write(f"Alpha med:  {alpha_stats['alpha_median']:.6f}\n\n")
-        f.write(f"{'Dataset':<25s} {'Gate mean':>10s} {'Gate std':>10s} "
-                f"{'Gate peak':>10s} {'Samples':>8s}\n")
-        f.write("-" * 65 + "\n")
+        f.write(f"{'Dataset':<25s} {'peak':>8s} {'spatial_std':>12s} "
+                f"{'grad':>8s} {'spars@50':>9s} {'spars@20':>9s} {'N':>5s}\n")
+        f.write("-" * 80 + "\n")
         for ds_key in dataset_keys:
             res = per_dataset_results.get(ds_key)
             if res is None:
                 continue
             f.write(f"{res['label']:<25s} "
-                    f"{res['gate_mean_avg']:10.4f} "
-                    f"{res['gate_mean_std']:10.4f} "
-                    f"{res['gate_max_avg']:10.4f} "
-                    f"{res['n_samples']:8d}\n")
+                    f"{res['peak_avg']:8.4f} "
+                    f"{res['spatial_std_avg']:12.4f} "
+                    f"{res['grad_mag_avg']:8.4f} "
+                    f"{res['sparsity50_avg']:9.3f} "
+                    f"{res['sparsity20_avg']:9.3f} "
+                    f"{res['n_samples']:5d}\n")
 
     print(f"\n  Summary saved to: {summary_path}")
     print(f"  Visualisations saved to: {cli_args.output_dir}/<dataset>/\n")
