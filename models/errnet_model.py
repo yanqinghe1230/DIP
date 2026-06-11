@@ -575,7 +575,7 @@ class ERRNetModel(ERRNetBase):
                 gate_out = output  # (B, n_feats, H, W)
                 captured['gate_activation'] = gate_out.mean(
                     dim=1, keepdim=True).detach().cpu()
-            captured['gate_alpha'] = F.softplus(module.gate_alpha).detach().cpu()
+            captured['gate_alpha'] = F.softplus(net.gate_alpha).detach().cpu()
 
         def _hook_structure_aware(module, input, output):
             # input = (feats, lap_features, mask)
