@@ -7,19 +7,30 @@ Computes PSNR, SSIM, NCC, LMSE for:
   2. ERRNet output        vs GT
   3. Final model output   vs GT
 
+Key behaviour: all images are resized to the model output resolution before
+comparison. GT is downscaled (not upscaling the output), which avoids
+introducing blur artifacts from bicubic upsampling.
+
 Usage:
+  # Only compare ERRNet baseline
+  python eval_custom.py \
+      --input_dir   ./datasets/raw_data/my_test_images \
+      --gt_dir      ./datasets/raw_data/my_test_gt \
+      --errnet_dir  ./results/errnet_baseline
+
+  # Compare both ERRNet and final model
   python eval_custom.py \
       --input_dir   ./datasets/raw_data/my_test_images \
       --gt_dir      ./datasets/raw_data/my_test_gt \
       --errnet_dir  ./results/errnet_baseline \
-      --model_dir   ./results/errnet_simple_gate \
-      --model_name  errnet
+      --model_dir   ./results/simple_gate \
+      --model_name  errnet_sg
 """
 
 import argparse
 import os
 import sys
-from os.path import join, basename, splitext
+from os.path import join, splitext
 
 import numpy as np
 from PIL import Image
@@ -30,86 +41,67 @@ from util.index import quality_assess
 
 
 def find_image_files(directory, extensions=('.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.tif')):
-    """Return sorted list of image filenames (with extension) in directory."""
+    """Return sorted list of image filenames in directory."""
     if not os.path.isdir(directory):
         raise FileNotFoundError(f'Directory not found: {directory}')
-    files = sorted(
+    return sorted(
         f for f in os.listdir(directory)
         if f.lower().endswith(extensions) and not f.startswith('.')
     )
-    return files
 
 
 def load_image(path):
     """Load image as uint8 numpy array (H, W, 3), RGB."""
-    img = Image.open(path).convert('RGB')
-    return np.array(img)
+    return np.array(Image.open(path).convert('RGB'))
 
 
-def _resolve_output_path(result_dir, fname, model_name):
-    """Resolve output image path given the test() output convention.
+def resize_to_match(src, ref_hw):
+    """Resize src to (ref_h, ref_w) using high-quality Lanczos filter."""
+    if src.shape[:2] == ref_hw:
+        return src
+    return np.array(Image.fromarray(src).resize(
+        (ref_hw[1], ref_hw[0]), Image.LANCZOS))
 
-    test() saves: {result_dir}/{save_subdir}/{stem}/{model_name}.png
-    But result_dir may already include the save_subdir, so try multiple patterns.
+
+def _resolve_output_path(result_dir, stem, model_name):
+    """Resolve output image path for a given image stem.
+
+    test() saves: {result_dir}/[{save_subdir}/]{stem}/{model_name}.png
     """
-    stem = splitext(fname)[0]
-
-    # Pattern 1: result_dir is the save_subdir itself
-    #   results/custom/img_stem/errnet.png
+    # Pattern 1: result_dir/{stem}/{model_name}.png
     path = join(result_dir, stem, f'{model_name}.png')
-    if os.path.exists(path):
+    if os.path.isfile(path):
         return path
 
     # Pattern 2: result_dir/{any_subdir}/{stem}/{model_name}.png
-    #   Used with --save_subdir override
-    for sub in sorted(os.listdir(result_dir)):
-        p = join(result_dir, sub, stem, f'{model_name}.png')
-        if os.path.exists(p):
-            return p
-        # Also try without per-image subfolder (flat output)
-        p2 = join(result_dir, sub, f'{fname}')
-        if os.path.exists(p2):
-            return p2
+    if os.path.isdir(result_dir):
+        for sub in sorted(os.listdir(result_dir)):
+            subdir = join(result_dir, sub)
+            if os.path.isdir(subdir):
+                p = join(subdir, stem, f'{model_name}.png')
+                if os.path.isfile(p):
+                    return p
 
-    # Pattern 3: flat directory, filename matches
-    for ext in ('.png', '.jpg', '.jpeg'):
-        p = join(result_dir, f'{stem}{ext}')
-        if os.path.exists(p):
-            return p
-
-    # Pattern 4: result_dir/{stem}/{model_name}.png directly
-    path = join(result_dir, stem, f'{model_name}.png')
-    if os.path.exists(path):
+    # Pattern 3: result_dir/{stem}.png  (flat output)
+    path = join(result_dir, f'{stem}.png')
+    if os.path.isfile(path):
         return path
 
     return None
 
 
-def resolve_outputs(result_dir, image_files, model_name):
-    """Match each input filename to its corresponding output image path."""
-    resolved = []
-    for fname in image_files:
-        path = _resolve_output_path(result_dir, fname, model_name)
-        resolved.append(path)
-    return resolved
-
-
-def compute_metrics(estimate_path, gt_path):
-    """Compute PSNR, SSIM, NCC, LMSE. Returns dict or None on failure."""
-    try:
-        est = load_image(estimate_path)
-        gt = load_image(gt_path)
-
-        # Ensure same size — if mismatch, resize estimate to match GT
-        if est.shape[:2] != gt.shape[:2]:
-            est = np.array(Image.fromarray(est).resize(
-                (gt.shape[1], gt.shape[0]), Image.BICUBIC))
-
-        metrics = quality_assess(est, gt)
-        return metrics
-    except Exception as e:
-        print(f'  [WARN] {estimate_path}: {e}')
+def _infer_model_name_from_dir(result_dir):
+    """Try to find the model name by looking at existing output files."""
+    if not os.path.isdir(result_dir):
         return None
+    # Look inside subdirectories
+    for item in sorted(os.listdir(result_dir)):
+        sub = join(result_dir, item)
+        if os.path.isdir(sub):
+            for f in os.listdir(sub):
+                if f.lower().endswith('.png') and f != 'm_input.png':
+                    return splitext(f)[0]
+    return None
 
 
 def main():
@@ -120,17 +112,17 @@ def main():
     parser.add_argument('--gt_dir', required=True,
                         help='Directory containing ground truth images')
     parser.add_argument('--errnet_dir', default=None,
-                        help='Result directory for ERRNet baseline output')
+                        help='Result directory for ERRNet baseline')
     parser.add_argument('--model_dir', default=None,
-                        help='Result directory for final model output')
-    parser.add_argument('--model_name', default='errnet',
-                        help='Output filename prefix for model (default: errnet)')
+                        help='Result directory for final model')
+    parser.add_argument('--model_name', default=None,
+                        help='Output filename for final model (auto-detect if not set)')
     parser.add_argument('--errnet_name', default='errnet',
-                        help='Output filename prefix for ERRNet baseline (default: errnet)')
-    parser.add_argument('--gt_ext', default=None,
-                        help='Force GT file extension (e.g. .png). If not set, match by stem.')
+                        help='Output filename for ERRNet baseline (default: errnet)')
     parser.add_argument('--gt_suffix', default=None,
-                        help='Suffix appended to stem to form GT filename (e.g. "_gt" for img_gt.png)')
+                        help='Suffix to strip from GT stem, e.g. "_gt" for "img_gt.png"')
+    parser.add_argument('--no_resize_gt', action='store_true',
+                        help='Do NOT resize GT to output resolution (not recommended)')
     args = parser.parse_args()
 
     # ---- Find input images ----
@@ -147,116 +139,148 @@ def main():
         print(f'[ERROR] No GT images found in {gt_dir}')
         sys.exit(1)
 
-    # Build GT lookup: stem → path
     gt_map = {}
     for f in gt_files:
         stem = splitext(f)[0]
-        # Strip suffix if configured
         if args.gt_suffix and stem.endswith(args.gt_suffix):
             stem = stem[:-len(args.gt_suffix)]
         gt_map[stem] = join(gt_dir, f)
-
     print(f'Found {len(gt_files)} GT images in {gt_dir}')
 
     # ---- Resolve model outputs ----
-    errnet_map = {}
-    if args.errnet_dir:
-        errnet_outputs = resolve_outputs(args.errnet_dir, input_files, args.errnet_name)
-        for fname, path in zip(input_files, errnet_outputs):
-            if path:
-                errnet_map[splitext(fname)[0]] = path
+    def build_output_map(result_dir, model_name, label):
+        """Build stem→path mapping for model outputs."""
+        out_map = {}
+        if not result_dir:
+            return out_map
+        if not os.path.isdir(result_dir):
+            print(f'[WARN] {label} directory not found: {result_dir}')
+            return out_map
 
-    model_map = {}
-    if args.model_dir:
-        model_outputs = resolve_outputs(args.model_dir, input_files, args.model_name)
-        for fname, path in zip(input_files, model_outputs):
-            if path:
-                model_map[splitext(fname)[0]] = path
+        # Auto-detect model name
+        if model_name is None:
+            model_name = _infer_model_name_from_dir(result_dir)
+        if model_name is None:
+            print(f'[WARN] {label}: cannot determine model name, using "errnet"')
+            model_name = 'errnet'
 
-    # ---- Compute metrics ----
+        found = 0
+        for fname in input_files:
+            stem = splitext(fname)[0]
+            path = _resolve_output_path(result_dir, stem, model_name)
+            if path:
+                out_map[stem] = path
+                found += 1
+
+        print(f'{label}: matched {found}/{len(input_files)} outputs '
+              f'(name="{model_name}", dir={result_dir})')
+        if found == 0:
+            print(f'  [WARN] No outputs found. Check --{label.lower()}_name and directory structure.')
+            print(f'  Expected: {result_dir}/<stem>/{model_name}.png')
+        return out_map, model_name
+
+    errnet_map, errnet_name = build_output_map(args.errnet_dir, args.errnet_name, 'ERRNet')
+    model_map, model_name = build_output_map(args.model_dir, args.model_name, 'Model')
+
+    # ---- Build category list ----
     categories = ['Input']
     if errnet_map:
         categories.append('ERRNet')
     if model_map:
         categories.append('Model')
 
-    all_results = {cat: [] for cat in categories}
+    # ---- Determine reference resolution ----
+    # Use the first available model output to determine the evaluation resolution.
+    # GT (and optionally input) will be downscaled to this resolution.
+    ref_hw = None
+    for out_map in [model_map, errnet_map]:
+        if out_map:
+            first_path = next(iter(out_map.values()))
+            ref_img = load_image(first_path)
+            ref_hw = ref_img.shape[:2]
+            break
 
-    print(f'\n{"="*80}')
-    print(f'{"Image":<30} {"Type":<10} {"PSNR":>8} {"SSIM":>8} {"NCC":>8} {"LMSE":>10}')
-    print(f'{"-"*80}')
+    if ref_hw is None:
+        # No model outputs: use input resolution as reference
+        first_input = load_image(join(args.input_dir, input_files[0]))
+        ref_hw = first_input.shape[:2]
+        print(f'\nNo model outputs found. Using input resolution as reference: '
+              f'{ref_hw[1]}x{ref_hw[0]}')
+    else:
+        print(f'\nEvaluation resolution (from model output): {ref_hw[1]}x{ref_hw[0]}')
+
+    # ---- Compute metrics ----
+    all_results = {cat: [] for cat in categories}
+    resolutions = {}  # for debug
+
+    print(f'\n{"="*85}')
+    print(f'{"Image":<25} {"Type":<8} {"PSNR":>8} {"SSIM":>8} {"NCC":>8} {"LMSE":>10}')
+    print(f'{"-"*85}')
 
     matched = 0
-    skipped_input = 0
-    skipped_errnet = 0
-    skipped_model = 0
+    skipped = {cat: 0 for cat in categories}
 
     for fname in input_files:
         stem = splitext(fname)[0]
         input_path = join(args.input_dir, fname)
 
         # Find GT
-        gt_path = None
-        if stem in gt_map:
-            gt_path = gt_map[stem]
-        elif args.gt_ext:
-            gt_path = join(gt_dir, stem + args.gt_ext)
-        if gt_path is None or not os.path.exists(gt_path):
-            print(f'  [SKIP] {stem}: GT not found (looked for stem="{stem}")')
+        gt_path = gt_map.get(stem)
+        if gt_path is None:
+            print(f'  [SKIP] {stem}: GT not found (stem="{stem}")')
             continue
 
         matched += 1
+        gt_full = load_image(gt_path)
 
-        # Input vs GT
-        m = compute_metrics(input_path, gt_path)
-        if m:
-            all_results['Input'].append(m)
-            print(f'{stem:<30} {"Input":<10} {m["PSNR"]:>8.2f} {m["SSIM"]:>8.4f} '
-                  f'{m["NCC"]:>8.4f} {m["LMSE"]:>10.6f}')
+        # Resize GT to reference resolution
+        if args.no_resize_gt:
+            gt = gt_full
+            eval_hw = gt_full.shape[:2]
         else:
-            skipped_input += 1
+            gt = resize_to_match(gt_full, ref_hw)
+            eval_hw = ref_hw
 
-        # ERRNet vs GT
-        if 'ERRNet' in categories:
-            if stem in errnet_map:
-                m = compute_metrics(errnet_map[stem], gt_path)
-                if m:
-                    all_results['ERRNet'].append(m)
-                    print(f'{stem:<30} {"ERRNet":<10} {m["PSNR"]:>8.2f} {m["SSIM"]:>8.4f} '
-                          f'{m["NCC"]:>8.4f} {m["LMSE"]:>10.6f}')
-                else:
-                    skipped_errnet += 1
+        # ---- Evaluate each category ----
+        for cat in categories:
+            if cat == 'Input':
+                est_path = input_path
+            elif cat == 'ERRNet':
+                est_path = errnet_map.get(stem)
+            elif cat == 'Model':
+                est_path = model_map.get(stem)
             else:
-                skipped_errnet += 1
-                print(f'{stem:<30} {"ERRNet":<10} {"--":>8} {"--":>8} {"--":>8} {"--":>10} '
-                      f'(output not found)')
+                continue
 
-        # Model vs GT
-        if 'Model' in categories:
-            if stem in model_map:
-                m = compute_metrics(model_map[stem], gt_path)
-                if m:
-                    all_results['Model'].append(m)
-                    print(f'{stem:<30} {"Model":<10} {m["PSNR"]:>8.2f} {m["SSIM"]:>8.4f} '
-                          f'{m["NCC"]:>8.4f} {m["LMSE"]:>10.6f}')
-                else:
-                    skipped_model += 1
-            else:
-                skipped_model += 1
-                print(f'{stem:<30} {"Model":<10} {"--":>8} {"--":>8} {"--":>8} {"--":>10} '
-                      f'(output not found)')
+            if est_path is None:
+                skipped[cat] += 1
+                continue
+
+            try:
+                est = load_image(est_path)
+                resolutions.setdefault(cat, []).append(est.shape[:2])
+
+                # Resize estimate to evaluation resolution if needed
+                if est.shape[:2] != eval_hw:
+                    est = resize_to_match(est, eval_hw)
+
+                metrics = quality_assess(est, gt)
+                all_results[cat].append(metrics)
+                print(f'{stem:<25} {cat:<8} {metrics["PSNR"]:>8.2f} {metrics["SSIM"]:>8.4f} '
+                      f'{metrics["NCC"]:>8.4f} {metrics["LMSE"]:>10.6f}')
+            except Exception as e:
+                skipped[cat] += 1
+                print(f'{stem:<25} {cat:<8} {"--":>8} {"--":>8} {"--":>8} {"--":>10} '
+                      f'(error: {e})')
 
         print()
 
     # ---- Summary ----
-    print(f'{"="*80}')
+    print(f'{"="*85}')
     print(f'\nSummary ({matched} images evaluated)')
-    if skipped_input:
-        print(f'  Skipped input:     {skipped_input}')
-    if skipped_errnet:
-        print(f'  Skipped ERRNet:    {skipped_errnet}')
-    if skipped_model:
-        print(f'  Skipped Model:     {skipped_model}')
+    for cat in categories:
+        if skipped[cat]:
+            print(f'  Skipped {cat}: {skipped[cat]}')
     print()
 
     header = f'{"Method":<12} {"PSNR":>8} {"SSIM":>8} {"NCC":>8} {"LMSE":>10}'
@@ -266,45 +290,47 @@ def main():
     for cat in categories:
         results = all_results[cat]
         if results:
-            avg_psnr = np.mean([r['PSNR'] for r in results])
-            avg_ssim = np.mean([r['SSIM'] for r in results])
-            avg_ncc = np.mean([r['NCC'] for r in results])
-            avg_lmse = np.mean([r['LMSE'] for r in results])
-            print(f'{cat:<12} {avg_psnr:>8.2f} {avg_ssim:>8.4f} '
-                  f'{avg_ncc:>8.4f} {avg_lmse:>10.6f}')
+            avg = {k: np.mean([r[k] for r in results]) for k in ('PSNR', 'SSIM', 'NCC', 'LMSE')}
+            print(f'{cat:<12} {avg["PSNR"]:>8.2f} {avg["SSIM"]:>8.4f} '
+                  f'{avg["NCC"]:>8.4f} {avg["LMSE"]:>10.6f}')
         else:
             print(f'{cat:<12} {"--":>8} {"--":>8} {"--":>8} {"--":>10}')
 
-    # Per-image breakdown table
+    # ---- Resolution diagnostics ----
+    print(f'\n{"="*85}')
+    print('Resolution diagnostics:')
+    print(f'  GT native:            {gt_full.shape[1]}x{gt_full.shape[0]}')
+    print(f'  Evaluation resolution: {eval_hw[1]}x{eval_hw[0]}')
+    for cat in categories:
+        if cat in resolutions and resolutions[cat]:
+            rs = resolutions[cat]
+            h_set = sorted(set(r[0] for r in rs))
+            w_set = sorted(set(r[1] for r in rs))
+            print(f'  {cat} output:       {w_set} x {h_set}')
+
+    # ---- Per-image breakdown ----
     if matched > 1:
-        print(f'\n{"="*80}')
+        print(f'\n{"="*85}')
         print('Per-image breakdown:')
-        col_widths = {'PSNR': 8, 'SSIM': 8, 'NCC': 8, 'LMSE': 10}
         for metric in ('PSNR', 'SSIM', 'NCC', 'LMSE'):
-            print(f'\n  {metric}:')
-            print(f'  {"Image":<30}', end='')
+            print(f'\n  --- {metric} ---')
+            print(f'  {"Image":<25}', end='')
             for cat in categories:
                 if all_results[cat]:
                     print(f' {cat:>10}', end='')
             print()
 
-            # Collect per-image values across categories
-            img_metrics = {}
             for i, fname in enumerate(input_files):
                 stem = splitext(fname)[0]
-                img_metrics[stem] = {}
+                print(f'  {stem:<25}', end='')
                 for cat in categories:
                     if i < len(all_results[cat]):
-                        img_metrics[stem][cat] = all_results[cat][i][metric]
+                        val = all_results[cat][i][metric]
+                        fmt = f'{val:>10.2f}' if metric == 'PSNR' else f'{val:>10.4f}'
+                        print(f' {fmt}', end='')
                     else:
-                        img_metrics[stem][cat] = None
-
-            for stem, vals in sorted(img_metrics.items()):
-                if all(v is not None for v in vals.values()):
-                    print(f'  {stem:<30}', end='')
-                    for cat in categories:
-                        print(f' {vals[cat]:>10.4f}' if metric != 'PSNR' else f' {vals[cat]:>10.2f}', end='')
-                    print()
+                        print(f' {"--":>10}', end='')
+                print()
 
 
 if __name__ == '__main__':
