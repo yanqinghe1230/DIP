@@ -13,20 +13,14 @@ python datasets/prepare_train_data.py
 ### Stage 1：RDNet 预训练
 
 ```bash
-python train_rdnet.py --name rdnet_
+python train_rdnet.py --name rdnet_gradmask
 ```
 
-### Stage 2：ERRNet + RDNet + Simple Gate 联合训练
+### Stage 2：ERRNet + RDNet联合训练
 
 ```bash
-python train_errnet_unaligned.py --name errnet_gate --hyper -r \
-    --rdnet_path checkpoints/rdnet_/latest_net_G.pth \
-    --use_rdnet --rdnet_guidance gate --gate_type simple
+python train_errnet.py --use_rdnet --rdnet_path <rdnet_ckpt> --rdnet_guidance gate --gate_type simple --name errnet_gate --hyper
 ```
-
-> `train_errnet_unaligned.py` 中 `opt.gate_type` 需确认为 `'simple'`。
-
----
 
 ## 测试
 
@@ -34,19 +28,11 @@ python train_errnet_unaligned.py --name errnet_gate --hyper -r \
 
 ```bash
 python test_errnet.py --name test --dataset <name> -r \
-    --icnn_path checkpoints/errnet_simple_gate/latest_net_G.pth \
+    --icnn_path <model_ckpt> \
     --use_rdnet --rdnet_guidance gate --gate_type simple --hyper
 ```
 
-可选 `<name>`：`ceilnet_table2` `real20` `postcard` `objects` `wild` `sir2_withgt`
-
-### 自定义图片
-
-```bash
-python test_errnet.py --name test --dataset custom --input_dir <path> -r \
-    --icnn_path checkpoints/errnet_simple_gate/latest_net_G.pth \
-    --use_rdnet --rdnet_guidance gate --gate_type simple --hyper
-```
+可选 `<name>`：`ceilnet_table2` `real20` `postcard` `objects` `wild` 
 
 ### 批量测试
 
